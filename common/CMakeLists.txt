@@ -53,7 +53,10 @@ endif()
 
 set(TARGET llama-common)
 
+include(parsers/sources.cmake)
+
 add_library(${TARGET}
+    ${LLAMA_CHAT_PARSERS_SOURCES}
     arg.cpp
     arg.h
     base64.hpp
@@ -75,14 +78,18 @@ add_library(${TARGET}
     download.h
     fit.cpp
     fit.h
+    file-lock.cpp
+    file-lock.h
     hf-cache.cpp
     hf-cache.h
     http.h
     imatrix-loader.cpp
     imatrix-loader.h
-    json-partial.cpp
-    json-partial.h
     json-schema-to-grammar.cpp
+    json-schema.cpp
+    json-schema.h
+    json.cpp
+    json.h
     kv-mean-center.cpp
     kv-mean-center.h
     llguidance.cpp
@@ -98,14 +105,16 @@ add_library(${TARGET}
     peg-parser.h
     preset.cpp
     preset.h
-    regex-partial.cpp
     reasoning-budget.cpp
     reasoning-budget.h
-    regex-partial.h
     sampling.cpp
     sampling.h
     speculative.cpp
     speculative.h
+    subproc.cpp
+    subproc.h
+    trie.cpp
+    trie.h
     unicode.cpp
     unicode.h
     jinja/lexer.cpp
@@ -123,13 +132,18 @@ add_library(${TARGET}
     )
 
 set_target_properties(${TARGET} PROPERTIES
-    VERSION ${LLAMA_INSTALL_VERSION}
-    SOVERSION 0
+    VERSION ${LLAMA_VERSION_BASE}
+    SOVERSION ${LLAMA_VERSION_MAJOR}
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
-target_include_directories(${TARGET} PUBLIC . ../vendor)
+target_include_directories(${TARGET} PUBLIC .)
+target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
+
+if (LLAMA_SUBPROCESS)
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -200,33 +214,34 @@ if (LLAMA_DSPARK_MARKOV_BLAS)
 endif()
 
 if (LLAMA_DSPARK_MARKOV_CUDA)
-    # The CUDA language and CMAKE_CUDA_ARCHITECTURES are already established by
-    # ggml's CUDA backend build; reuse them for the self-contained resample TU.
+    if (NOT GGML_CUDA)
+        message(FATAL_ERROR "LLAMA_DSPARK_MARKOV_CUDA requires GGML_CUDA")
+    endif()
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
-
-    target_sources(${TARGET} PRIVATE dspark-markov.cu)
-    target_compile_definitions(${TARGET} PRIVATE LLAMA_DSPARK_MARKOV_CUDA)
-    target_link_libraries(${TARGET} PRIVATE CUDA::cudart)
-
-    if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        # CMAKE_CUDA_ARCHITECTURES is resolved inside ggml's CUDA backend
-        # subdirectory (auto-detect / GGML_CUDA_ARCHITECTURES) with a plain set(),
-        # so it does not propagate up to this scope. Pinning "80" would build the
-        # resample TU for SM80 only -- forcing a PTX JIT on Hopper/H100 (sm_90) and
-        # failing outright on the pre-Ampere GPUs the rest of ggml still supports.
-        # Inherit the exact architecture list the ggml CUDA backend was built for.
-        if (TARGET ggml-cuda)
-            get_target_property(_dspark_markov_cuda_archs ggml-cuda CUDA_ARCHITECTURES)
-        endif()
-        if (_dspark_markov_cuda_archs)
-            set_target_properties(${TARGET} PROPERTIES CUDA_ARCHITECTURES "${_dspark_markov_cuda_archs}")
-        else()
-            # ggml-cuda target/property unavailable: detect the build machine's GPU
-            # (e.g. sm_90 on H100) rather than defaulting to SM80 only.
-            set_target_properties(${TARGET} PROPERTIES CUDA_ARCHITECTURES "native")
-        endif()
+    if (TARGET ggml-cuda)
+        # CUDA architecture defaults are scoped to the ggml-cuda directory.
+        get_target_property(LLAMA_CUDA_ARCHITECTURES ggml-cuda CUDA_ARCHITECTURES)
+        set_property(TARGET ${TARGET} PROPERTY CUDA_ARCHITECTURES "${LLAMA_CUDA_ARCHITECTURES}")
     endif()
+    target_sources(${TARGET} PRIVATE dspark-markov.cu)
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_DSPARK_MARKOV_CUDA)
+    target_link_libraries(${TARGET} PRIVATE CUDA::cudart)
+endif()
+
+if (LLAMA_DSPARK_MARKOV_METAL)
+    if (NOT APPLE OR NOT GGML_METAL)
+        message(FATAL_ERROR "LLAMA_DSPARK_MARKOV_METAL requires Apple Metal")
+    endif()
+    target_sources(${TARGET} PRIVATE dspark-markov-metal.mm)
+    set_source_files_properties(dspark-markov-metal.mm PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_DSPARK_MARKOV_METAL)
+    target_link_libraries(${TARGET} PRIVATE "-framework Metal" "-framework Foundation")
 endif()
 
 target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
+
+if (CMAKE_SYSTEM_NAME MATCHES "AIX")
+    # AIX's flock() function comes from libbsd.a
+    target_link_libraries(${TARGET} PRIVATE -lbsd)
+endif()

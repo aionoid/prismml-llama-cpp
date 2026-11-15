@@ -198,18 +198,18 @@ class BuiltinRule:
 SPACE_RULE = '| " " | "\\n"{1,2} [ \\t]{0,20}'
 
 PRIMITIVE_RULES = {
-    'boolean'      : BuiltinRule('("true" | "false") space', []),
+    'boolean'      : BuiltinRule('("true" | "false")', []),
     'decimal-part' : BuiltinRule('[0-9]{1,16}', []),
     'integral-part': BuiltinRule('[0] | [1-9] [0-9]{0,15}', []),
-    'number'       : BuiltinRule('("-"? integral-part) ("." decimal-part)? ([eE] [-+]? integral-part)? space', ['integral-part', 'decimal-part']),
-    'integer'      : BuiltinRule('("-"? integral-part) space', ['integral-part']),
+    'number'       : BuiltinRule('("-"? integral-part) ("." decimal-part)? ([eE] [-+]? integral-part)?', ['integral-part', 'decimal-part']),
+    'integer'      : BuiltinRule('("-"? integral-part)', ['integral-part']),
     'value'        : BuiltinRule('object | array | string | number | boolean | null', ['object', 'array', 'string', 'number', 'boolean', 'null']),
-    'object'       : BuiltinRule('"{" space ( string ":" space value ("," space string ":" space value)* )? "}" space', ['string', 'value']),
-    'array'        : BuiltinRule('"[" space ( value ("," space value)* )? "]" space', ['value']),
-    'uuid'         : BuiltinRule(r'"\"" [0-9a-fA-F]{8} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{12} "\"" space', []),
+    'object'       : BuiltinRule('"{" space ( string ":" space value ("," space string ":" space value)* )? space "}"', ['string', 'value']),
+    'array'        : BuiltinRule('"[" space ( value ("," space value)* )? space "]"', ['value']),
+    'uuid'         : BuiltinRule(r'"\"" [0-9a-fA-F]{8} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{12} "\""', []),
     'char'         : BuiltinRule(r'[^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})', []),
-    'string'       : BuiltinRule(r'"\"" char* "\"" space', ['char']),
-    'null'         : BuiltinRule('"null" space', []),
+    'string'       : BuiltinRule(r'"\"" char* "\""', ['char']),
+    'null'         : BuiltinRule('"null"', []),
 }
 
 # TODO: support "uri", "email" string formats
@@ -217,9 +217,9 @@ STRING_FORMAT_RULES = {
     'date'            : BuiltinRule('[0-9]{4} "-" ( "0" [1-9] | "1" [0-2] ) "-" ( \"0\" [1-9] | [1-2] [0-9] | "3" [0-1] )', []),
     'time'            : BuiltinRule('([01] [0-9] | "2" [0-3]) ":" [0-5] [0-9] ":" [0-5] [0-9] ( "." [0-9]{3} )? ( "Z" | ( "+" | "-" ) ( [01] [0-9] | "2" [0-3] ) ":" [0-5] [0-9] )', []),
     'date-time'       : BuiltinRule('date "T" time', ['date', 'time']),
-    'date-string'     : BuiltinRule('"\\"" date "\\"" space', ['date']),
-    'time-string'     : BuiltinRule('"\\"" time "\\"" space', ['time']),
-    'date-time-string': BuiltinRule('"\\"" date-time "\\"" space', ['date-time']),
+    'date-string'     : BuiltinRule('"\\"" date "\\""', ['date']),
+    'time-string'     : BuiltinRule('"\\"" time "\\""', ['time']),
+    'date-time-string': BuiltinRule('"\\"" date-time "\\""', ['date-time']),
 }
 
 DOTALL = '[\\U00000000-\\U0010FFFF]'
@@ -319,7 +319,7 @@ class SchemaConverter:
                 out.append(f'[^"{"".join(rejects)}] {char_rule}*')
         visit(trie)
 
-        out.append(f' ){"" if trie.is_end_of_string else "?"} ["] space')
+        out.append(f' ){"" if trie.is_end_of_string else "?"} ["]')
         return ''.join(out)
 
     def _add_rule(self, name, rule):
@@ -549,7 +549,7 @@ class SchemaConverter:
         return self._add_rule(
             name,
             to_rule(transform()) if self._raw_pattern \
-                else "\"\\\"\" (" + to_rule(transform()) + ") \"\\\"\" space")
+                else "\"\\\"\" (" + to_rule(transform()) + ") \"\\\"\"")
 
 
     def _resolve_ref(self, ref):
@@ -566,6 +566,11 @@ class SchemaConverter:
         return self._format_literal(json.dumps(value))
 
     def visit(self, schema, name):
+        # An empty union ("anyOf": [], "oneOf": [] or "type": []) has no alternatives to build a rule from; drop the
+        # keyword and convert the rest of the schema (same as the C++ converter).
+        for key in ('oneOf', 'anyOf', 'type'):
+            if isinstance(schema, dict) and isinstance(schema.get(key), list) and not schema[key]:
+                return self.visit({k: v for k, v in schema.items() if k != key}, name)
         schema_type = schema.get('type')
         schema_format = schema.get('format')
         rule_name = name + '-' if name in RESERVED_NAMES else name or 'root'
@@ -580,10 +585,10 @@ class SchemaConverter:
             return self._add_rule(rule_name, self._generate_union_rule(name, [{**schema, 'type': t} for t in schema_type]))
 
         elif 'const' in schema:
-            return self._add_rule(rule_name, self._generate_constant_rule(schema['const']) + ' space')
+            return self._add_rule(rule_name, self._generate_constant_rule(schema['const']))
 
         elif 'enum' in schema:
-            rule = '(' + ' | '.join((self._generate_constant_rule(v) for v in schema['enum'])) + ') space'
+            rule = '(' + ' | '.join((self._generate_constant_rule(v) for v in schema['enum'])) + ')'
             return self._add_rule(rule_name, rule)
 
         elif schema_type in (None, 'object') and \
@@ -624,7 +629,7 @@ class SchemaConverter:
                     enum_intersection &= s
 
                 if enum_intersection:
-                    rule = '(' + ' | '.join((self._generate_constant_rule(v) for v in sorted(enum_intersection))) + ') space'
+                    rule = '(' + ' | '.join((self._generate_constant_rule(v) for v in sorted(enum_intersection))) + ')'
                     return self._add_rule(rule_name, rule)
 
             return self._add_rule(rule_name, self._build_object_rule(properties, required, hybrid_name, additional_properties=None))
@@ -638,12 +643,12 @@ class SchemaConverter:
                     ' "," space '.join(
                         self.visit(item, f'{name}{"-" if name else ""}tuple-{i}')
                         for i, item in enumerate(items)) +
-                    ' "]" space')
+                    ' space "]"')
             else:
                 item_rule_name = self.visit(items, f'{name}{"-" if name else ""}item')
                 min_items = schema.get("minItems", 0)
                 max_items = schema.get("maxItems")
-                return self._add_rule(rule_name, '"[" space ' + _build_repetition(item_rule_name, min_items, max_items, separator_rule='"," space') + ' "]" space')
+                return self._add_rule(rule_name, '"[" space ' + _build_repetition(item_rule_name, min_items, max_items, separator_rule='"," space') + ' space "]"')
 
         elif schema_type in (None, 'string') and 'pattern' in schema:
             return self._visit_pattern(schema['pattern'], rule_name)
@@ -663,7 +668,7 @@ class SchemaConverter:
             min_len = schema.get('minLength', 0)
             max_len = schema.get('maxLength')
 
-            return self._add_rule(rule_name, r'"\"" ' + _build_repetition(char_rule, min_len, max_len) + r' "\"" space')
+            return self._add_rule(rule_name, r'"\"" ' + _build_repetition(char_rule, min_len, max_len) + r' "\""')
 
         elif schema_type in (None, 'integer') and \
                 ('minimum' in schema or 'exclusiveMinimum' in schema or 'maximum' in schema or 'exclusiveMaximum' in schema):
@@ -680,7 +685,7 @@ class SchemaConverter:
 
             out = ["("]
             _generate_min_max_int(min_value, max_value, out)
-            out.append(") space")
+            out.append(")")
             return self._add_rule(rule_name, ''.join(out))
 
         elif (schema_type == 'object') or (len(schema) == 0):
@@ -734,6 +739,17 @@ class SchemaConverter:
             )
             optional_props.append("*")
 
+        # Also allow declared order while preserving required-first order (mirrors the C++ converter).
+        first_required = [k in required for k in sorted_props]
+        optional_before_required = any(not a and b for i, a in enumerate(first_required) for b in first_required[i + 1:])
+        declared_order_rule = None
+        if optional_before_required and first_required[0] and "*" not in prop_kv_rule_names:
+            declared_order_rule = '"{" space ' + prop_kv_rule_names[sorted_props[0]]
+            for k in sorted_props[1:]:
+                kv = f' "," space {prop_kv_rule_names[k]}'
+                declared_order_rule += kv if k in required else f' ({kv} )?'
+            declared_order_rule += ' space "}"'
+
         rule = '"{" space '
         rule += ' "," space '.join(prop_kv_rule_names[k] for k in required_props)
 
@@ -765,8 +781,10 @@ class SchemaConverter:
                 rule += ' )'
             rule += ' )?'
 
-        rule += ' "}" space'
+        rule += ' space "}"'
 
+        if declared_order_rule:
+            return declared_order_rule + ' | ' + rule
         return rule
 
     def format_grammar(self):
@@ -791,8 +809,10 @@ def main(args_in = None):
         help='''
             comma-separated property names defining the order of precedence for object properties;
             properties not specified here are given lower precedence than those that are, and
-            are kept in their original order from the schema. Required properties are always
-            given precedence over optional properties.
+            are kept in their original order from the schema. Required properties are given
+            precedence over optional properties. When (in this ordering) an optional property comes
+            before a required one, the first property is required and additional properties are not
+            allowed, this ordering is also accepted, with optional properties skippable in place.
         '''
     )
     parser.add_argument(

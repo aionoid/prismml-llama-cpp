@@ -1,71 +1,37 @@
 #include "models.h"
 
-#include <cmath>
+#include <cstdlib>
+#include <cstring>
 
-// dspark: EAGLE-style block-diffusion speculative-decoding drafter.
-//
-// The trunk is a small, plain dense Qwen3-style stack (standard llama_layer
-// attn_*/ffn_* tensors, loaded exactly like src/models/qwen3.cpp). What makes
-// the per-layer body genuinely novel is the attention: at every layer, the
-// drafter attends to two concatenated K/V sources built from DIFFERENT inputs:
-//
-//   1. a small, growing window of the TARGET model's captured multi-layer tap
-//      features (concatenated across n_dspark_target_layers layers, projected
-//      down to n_embd via dspark.fc + dspark.hidden_norm ONCE before the layer
-//      loop) -- re-projected FRESH every layer via THAT layer's own k_proj/
-//      v_proj. This is not a separate cross-attention block: it's the same
-//      k_proj/v_proj the trunk already has, just applied to a second input.
-//   2. the draft block's own evolving residual stream (block_size positions,
-//      seeded from mask_token_id + the last accepted token), projected via the
-//      same layer's k_proj/v_proj as usual.
-//
-// The two K/V sets are concatenated and attended to with a single, fully
-// unmasked (non-causal) softmax -- no hybrid causal/bidirectional masking is
-// needed (matches the reference: attention_mask=None, is_causal=False). Q only
-// ever exists for the draft block: the context rows never issue a query, never
-// run through the FFN, and never join the residual stream.
-//
-// Implementation note on how this maps onto llama.cpp's KV-cache attention
-// primitives (build_attn_inp_kv()/build_attn()), which assume Q/K/V(new) all
-// share one row count tied to ubatch.n_tokens: we set n_tokens = n_ctx_rows +
-// n_draft (matching the reference's cache.update() growth exactly -- see
-// docs/dspark-scope.md and the Python reference implementation in
-// (reference implementation), compute Q/K/V
-// uniformly over that full width each layer (so build_qkv()/build_attn() need
-// no changes), then slice the attention OUTPUT back down to the trailing
-// n_draft columns before the residual add. The "wasted" query rows computed
-// for the context positions are discarded immediately and are provably
-// harmless: attention output is row-independent (each output row depends only
-// on its own Q row dotted against the shared K/V), so slicing them away here
-// is bit-identical to never having computed them.
-//
-// The persistent, growing KV cache itself (real llama_kv_cache_unified, not a
-// no-cache arch) is what makes the incremental multi-round drafting loop
-// possible; that loop (advance-by-n_accepted, crop the cache back to `start`)
-// is Phase 2 (common/speculative.cpp) and is NOT built here. Likewise the
-// markov_head / confidence_head auxiliary tensors are loaded below but not
-// wired into this graph: their application is a small, sequential, host-side
-// resample loop (see docs/dspark-scope.md's block-draft loop design and the
-// ground-truth note about never batching the markov resample over
-// mask_token_id) that belongs to Phase 2. res->t_logits here is the BASE
-// trunk logits (dspark.fc -> trunk -> output_norm -> output), pre markov-bias.
+// Noncausal block drafter: target tap features provide context K/V while draft
+// tokens pass through the dense trunk and sequential correction/Markov head.
 
 void llama_model_dspark::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
-    ml.get_key(LLM_KV_DSPARK_BLOCK_SIZE,    hparams.dspark_block_size,    true);
+    ml.get_key(LLM_KV_DSPARK_BLOCK_SIZE, hparams.dspark_block_size, true);
     ml.get_key(LLM_KV_DSPARK_MASK_TOKEN_ID, hparams.dspark_mask_token_id, true);
-    ml.get_key(LLM_KV_DSPARK_MARKOV_RANK,   hparams.dspark_markov_rank,   false);
-    ml.get_key(LLM_KV_DSPARK_CONFIDENCE_HEAD,             hparams.dspark_confidence_head,             false);
-    ml.get_key(LLM_KV_DSPARK_CONFIDENCE_WITH_MARKOV,      hparams.dspark_confidence_head_with_markov,  false);
+    ml.get_key(LLM_KV_DSPARK_MARKOV_RANK, hparams.dspark_markov_rank, false);
+    ml.get_key(LLM_KV_DSPARK_HIDDEN_CORRECTION, hparams.dspark_hidden_correction, false);
+    ml.get_key(LLM_KV_DSPARK_MARKOV_DEPLOY_EXPOSURE, hparams.dspark_markov_deploy_exposure, false);
+    if (hparams.dspark_hidden_correction) {
+        ml.get_key(LLM_KV_DSPARK_CORRECTION_SIZE, hparams.dspark_correction_size, true);
+        if (!hparams.dspark_markov_deploy_exposure || !hparams.dspark_correction_size || !hparams.dspark_markov_rank) {
+            throw std::runtime_error(
+                "DSpark hidden correction requires deploy-exposure Markov and positive dimensions");
+        }
+    } else if (hparams.dspark_markov_deploy_exposure) {
+        throw std::runtime_error("DSpark deploy-exposure without hidden correction is not implemented");
+    }
+    ml.get_key(LLM_KV_DSPARK_CONFIDENCE_HEAD, hparams.dspark_confidence_head, false);
+    ml.get_key(LLM_KV_DSPARK_CONFIDENCE_WITH_MARKOV, hparams.dspark_confidence_head_with_markov, false);
 
-    // GIDD log-SNR conditioning: optional metadata, absent (and defaulted off)
-    // on drafters not trained with it, which must keep loading unchanged. When
-    // it is enabled the bounds are required and drive a divide in the
-    // featurization (t = (log_snr - min) / (max - min)), so they must be present,
-    // finite, and strictly ordered -- otherwise the embedding is silently NaN.
+    // Noise-level conditioning is optional; older checkpoints omit it.
     ml.get_key(LLM_KV_DSPARK_LOG_SNR_CONDITIONING, hparams.dspark_log_snr_conditioning, false);
     if (hparams.dspark_log_snr_conditioning) {
+        // required once the flag is set: silently defaulting either bound to 0.0f
+        // would collapse (max_snr - min_snr) to zero in the featurizer below and
+        // fill the conditioning input with NaNs instead of failing to load.
         ml.get_key(LLM_KV_DSPARK_MIN_LOG_SNR, hparams.dspark_min_log_snr, true);
         ml.get_key(LLM_KV_DSPARK_MAX_LOG_SNR, hparams.dspark_max_log_snr, true);
         if (!std::isfinite(hparams.dspark_min_log_snr) || !std::isfinite(hparams.dspark_max_log_snr)) {
@@ -101,51 +67,85 @@ void llama_model_dspark::load_arch_tensors(llama_model_loader & ml) {
     // it ties to the TARGET model's vocab), so vocab.n_tokens() (LLAMA_LOAD_LOCALS'
     // n_vocab) is 0 here. The real vocab width only exists as the token_embd
     // tensor's own shape in the GGUF -- peek at it before creating anything.
-    ggml_tensor * tok_embd_meta = ml.get_tensor_meta(tn(LLM_TENSOR_TOKEN_EMBD, "weight").str().c_str());
+    ggml_tensor * tok_embd_meta  = ml.get_tensor_meta(tn(LLM_TENSOR_TOKEN_EMBD, "weight").str().c_str());
     const int64_t n_vocab_dspark = tok_embd_meta ? tok_embd_meta->ne[1] : n_vocab;
     GGML_ASSERT(n_vocab_dspark > 0 && "dspark: could not determine vocab size from token_embd.weight");
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab_dspark }, 0);
 
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), { n_embd, n_vocab_dspark }, TENSOR_NOT_REQUIRED);
-    if (output == NULL) {
-        // dspark's lm_head is a frozen copy of the target's, not tied to
-        // token_embd, but fall back the same way other dense arches do in
-        // case a future export ties them.
-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab_dspark }, TENSOR_DUPLICATED);
+    if (params.dspark_head_source) {
+        const auto & source = *params.dspark_head_source;
+        if (!source.output || source.output->ne[0] != n_embd || source.output->ne[1] != n_vocab_dspark ||
+            !source.output->buffer || source.output_s || source.output_in_s) {
+            throw std::runtime_error("DSpark shared head requires a loaded, dimension-matched, unscaled target head");
+        }
+        // Account for the local tensor without allocating or reading its weights.
+        create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_dspark }, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+        output = source.output;
+        hdmd.weight_blocks.erase("output.weight");
+        const auto rotation = source.hdmd.rot.find(output);
+        if (rotation != source.hdmd.rot.end()) {
+            hdmd.rot.emplace(output, rotation->second);
+        }
+    } else {
+        output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_dspark }, TENSOR_NOT_REQUIRED);
+        if (!output) {
+            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab_dspark }, TENSOR_DUPLICATED);
+        }
     }
 
     // target-feature projection: [n_capture * n_embd -> n_embd], then RMSNorm.
-    dspark_fc          = create_tensor(tn(LLM_TENSOR_DSPARK_FC,          "weight"), { n_embd_cap, n_embd }, 0);
+    dspark_fc          = create_tensor(tn(LLM_TENSOR_DSPARK_FC, "weight"), { n_embd_cap, n_embd }, 0);
     dspark_hidden_norm = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_NORM, "weight"), { n_embd }, 0);
 
     // auxiliary heads: loaded so the GGUF's tensor inventory is fully mapped
+    if (hparams.dspark_hidden_correction) {
+        const int64_t width = hparams.dspark_correction_size;
+        if (hparams.dspark_mask_token_id >= n_vocab_dspark) {
+            throw std::runtime_error("DSpark mask token outside vocabulary");
+        }
+        dspark_corr_hnorm = create_tensor(tn(LLM_TENSOR_DSPARK_CORR_HNORM, "weight"), { n_embd }, 0);
+        dspark_corr_enorm = create_tensor(tn(LLM_TENSOR_DSPARK_CORR_ENORM, "weight"), { n_embd }, 0);
+        dspark_corr_gate  = create_tensor(tn(LLM_TENSOR_DSPARK_CORR_GATE, "weight"), { 2 * n_embd, width }, 0);
+        dspark_corr_up    = create_tensor(tn(LLM_TENSOR_DSPARK_CORR_UP, "weight"), { 2 * n_embd, width }, 0);
+        dspark_corr_down  = create_tensor(tn(LLM_TENSOR_DSPARK_CORR_DOWN, "weight"), { width, n_embd }, 0);
+    }
     // and available to a future Phase 2 host-side loop, but not built into
     // this graph (see file header comment).
     if (markov_rank > 0) {
-        dspark_markov_head_a = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_HEAD_A, "weight"), { markov_rank, n_vocab_dspark }, TENSOR_NOT_REQUIRED);
-        dspark_markov_head_b = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_HEAD_B, "weight"), { markov_rank, n_vocab_dspark }, TENSOR_NOT_REQUIRED);
+        const int flags = hparams.dspark_hidden_correction ? 0 : TENSOR_NOT_REQUIRED;
+        dspark_markov_head_a =
+            create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_HEAD_A, "weight"), { markov_rank, n_vocab_dspark }, flags);
+        dspark_markov_head_b =
+            create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_HEAD_B, "weight"), { markov_rank, n_vocab_dspark }, flags);
     }
     if (hparams.dspark_confidence_head) {
         const int64_t conf_in = n_embd + (hparams.dspark_confidence_head_with_markov ? markov_rank : 0);
-        dspark_confidence_head   = create_tensor(tn(LLM_TENSOR_DSPARK_CONFIDENCE_HEAD, "weight"), { conf_in, 1 }, TENSOR_NOT_REQUIRED);
-        dspark_confidence_head_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONFIDENCE_HEAD, "bias"),   { 1 },         TENSOR_NOT_REQUIRED);
+        dspark_confidence_head =
+            create_tensor(tn(LLM_TENSOR_DSPARK_CONFIDENCE_HEAD, "weight"), { conf_in, 1 }, TENSOR_NOT_REQUIRED);
+        dspark_confidence_head_b =
+            create_tensor(tn(LLM_TENSOR_DSPARK_CONFIDENCE_HEAD, "bias"), { 1 }, TENSOR_NOT_REQUIRED);
+    }
+
+    dspark_mode_embedding =
+        create_tensor(tn(LLM_TENSOR_DSPARK_MODE_EMBEDDING, "bias"), { n_embd }, TENSOR_NOT_REQUIRED);
+    if (dspark_mode_embedding) {
+        LLAMA_LOG_INFO("dspark: mode embedding active on draft-token input only\n");
     }
 
     // GIDD log-SNR conditioning (LogSnrEmbed): unlike markov_head/confidence_head
-    // above, this IS built into the forward graph (graph::graph() below) -- it
-    // changes the draft embedding every forward pass, not a deferred host-side
+    // above, this IS built into this graph (graph::graph() below) -- it changes
+    // the draft embedding every forward pass, not a deferred host-side
     // adjustment -- so if the GGUF says log_snr_conditioning is on, the weights
-    // are REQUIRED. A missing tensor here is a broken conversion, not something
-    // to silently degrade past (a drafter trained with conditioning that runs
-    // without it produces wrong drafts).
+    // are REQUIRED: a missing tensor here is a broken conversion, not something
+    // to silently degrade past.
     if (hparams.dspark_log_snr_conditioning) {
-        const int64_t n_freq = 128; // sinusoidal feature count (LogSnrEmbed)
-        dspark_log_snr_fc1_w = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC1, "weight"), { n_freq, n_embd }, 0);
-        dspark_log_snr_fc1_b = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC1, "bias"),   { n_embd },         0);
-        dspark_log_snr_fc2_w = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC2, "weight"), { n_embd, n_embd }, 0);
-        dspark_log_snr_fc2_b = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC2, "bias"),   { n_embd },         0);
+        const int64_t n_freq = 128;  // matches LogSnrEmbed.NUM_FREQ_FEATURES in dspark_snr.py
+        dspark_log_snr_fc1_w = create_tensor(tn(LLM_TENSOR_DSPARK_PROD_LOG_SNR_FC1, "weight"), { n_freq, n_embd }, 0);
+        dspark_log_snr_fc1_b = create_tensor(tn(LLM_TENSOR_DSPARK_PROD_LOG_SNR_FC1, "bias"), { n_embd }, 0);
+        dspark_log_snr_fc2_w = create_tensor(tn(LLM_TENSOR_DSPARK_PROD_LOG_SNR_FC2, "weight"), { n_embd, n_embd }, 0);
+        dspark_log_snr_fc2_b = create_tensor(tn(LLM_TENSOR_DSPARK_PROD_LOG_SNR_FC2, "bias"), { n_embd }, 0);
     }
 
     for (int i = 0; i < n_layer; ++i) {
@@ -162,7 +162,7 @@ void llama_model_dspark::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, 0);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP, "weight", i), { n_embd, n_ff }, 0);
     }
 }
 
@@ -195,9 +195,9 @@ llama_model_dspark::graph::graph(const llama_model & model, const llm_graph_para
     // reserve-safe placeholder split used when nothing is staged at all --
     // mirrors how llm_graph_context::build_inp_cross_embd falls back to
     // hparams-derived sizes whenever llama_cross has no (matching) data.
-    const bool have_staged_ctx =
-        params.dspark_ctx && !params.dspark_ctx->v_ctx_feat.empty() &&
-        params.dspark_ctx->n_ctx_rows > 0 && params.dspark_ctx->n_ctx_rows < n_tokens;
+    const bool have_staged_ctx = params.dspark_ctx && !params.dspark_ctx->v_ctx_feat.empty() &&
+                                 params.dspark_ctx->n_ctx_rows > 0 && params.dspark_ctx->n_ctx_rows < n_tokens &&
+                                 n_tokens - params.dspark_ctx->n_ctx_rows <= hparams.dspark_block_size;
 
     int64_t n_ctx_rows;
     if (have_staged_ctx) {
@@ -207,15 +207,26 @@ llama_model_dspark::graph::graph(const llama_model & model, const llm_graph_para
         // for the draft block so n_draft is always >= 1, and exercise the
         // same concat/fc/hidden_norm topology as real usage whenever there's
         // more than one token to split.
-        n_ctx_rows = std::max<int64_t>(n_tokens - 1, 0);
+        n_ctx_rows = std::max<int64_t>(n_tokens - hparams.dspark_block_size, 0);
     }
 
     const int64_t n_draft = n_tokens - n_ctx_rows;
     GGML_ASSERT(n_draft > 0 && "dspark: no rows left for the draft block");
+    const char * reuse_env = std::getenv("LLAMA_DSPARK_REUSE_MASK");
+    if (reuse_env && std::strcmp(reuse_env, "0") && std::strcmp(reuse_env, "1")) {
+        throw std::runtime_error("LLAMA_DSPARK_REUSE_MASK must be 0 or 1");
+    }
+    const bool reuse_mask =
+        have_staged_ctx && hparams.dspark_hidden_correction && reuse_env && std::strcmp(reuse_env, "1") == 0;
 
-    ggml_tensor * target_ctx = nullptr;
+    ggml_tensor *                target_ctx   = nullptr;
+    llm_graph_input_dspark_ctx * staged_input = nullptr;
     if (n_ctx_rows > 0) {
         auto ctx_input = std::make_unique<llm_graph_input_dspark_ctx>(params.dspark_ctx);
+        staged_input   = ctx_input.get();
+        if (reuse_mask) {
+            ctx_input->reuse_mask_id = hparams.dspark_mask_token_id;
+        }
 
         ctx_input->ctx_feat = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_cap, n_ctx_rows);
         ggml_set_input(ctx_input->ctx_feat);
@@ -239,70 +250,89 @@ llama_model_dspark::graph::graph(const llama_model & model, const llm_graph_para
     // embeddings of whatever placeholder token id the caller put there and are
     // never used for anything.
     ggml_tensor * inpL = build_inp_embd(model.tok_embd);
-    inpL = ggml_view_2d(ctx0, inpL, n_embd, n_draft, inpL->nb[1], inpL->nb[1] * n_ctx_rows);
+    inpL               = ggml_view_2d(ctx0, inpL, n_embd, n_draft, inpL->nb[1], inpL->nb[1] * n_ctx_rows);
     cb(inpL, "dspark_draft_embd", -1);
 
-    // --- GIDD log-SNR conditioning (LogSnrEmbed) ----------------------------
-    // added to the draft noise embedding BEFORE the layer loop. The per-position
-    // log-SNR pattern is the fixed round-1 inference convention: the anchor
-    // position of each block (every block_size-th draft row, starting at 0) is
-    // set to max_log_snr, every other (masked) position to min_log_snr -- this
-    // drafter always operates on a full block_size-aligned draft block (see the
-    // file header), so n_draft is a multiple of block_size in every real decode.
+    // --- GIDD log-SNR conditioning (LogSnrEmbed, dspark_snr.py) --------------
+    // added to the draft noise embedding BEFORE the layer loop, matching
+    // Qwen3DSparkModelSnr._forward_backbone exactly. The per-position log-SNR
+    // pattern is the fixed round-1 inference convention: anchor position of
+    // each block (every block_size-th draft row, starting at 0) at
+    // max_log_snr, every other (masked) position at min_log_snr -- this
+    // drafter always operates on a full block_size-aligned draft block (see
+    // file header comment), so n_draft is a multiple of block_size in every
+    // real decode call.
     if (hparams.dspark_log_snr_conditioning) {
-        const int64_t n_freq   = 128;
-        const int64_t half     = n_freq / 2;
-        const float   min_snr  = hparams.dspark_min_log_snr;
-        const float   max_snr  = hparams.dspark_max_log_snr;
-        const int64_t bsz      = hparams.dspark_block_size > 0 ? hparams.dspark_block_size : n_draft;
+        const int64_t n_freq      = 128;
+        const int64_t half        = n_freq / 2;
+        const float   min_snr     = hparams.dspark_min_log_snr;
+        const float   max_snr     = hparams.dspark_max_log_snr;
+        const int64_t bsz         = hparams.dspark_block_size > 0 ? hparams.dspark_block_size : n_draft;
+        // Opt-in until real-weight parity and backend-specific timing pass.
+        const char *  compact_env = std::getenv("LLAMA_DSPARK_SNR_TWO_ROWS");
+        const bool    compact_snr = compact_env && std::strcmp(compact_env, "1") == 0 && n_draft > 2 && n_draft <= bsz;
+        const int64_t snr_rows    = compact_snr ? 2 : n_draft;
 
-        // host-side: the sinusoidal featurization fused with the anchor/mask
-        // pattern above. Both are pure functions of n_draft/block_size/min/max
-        // log-SNR -- no runtime/ubatch data -- so precomputing on the host
-        // (rather than chaining ggml_arange/sin/cos in-graph) keeps this
-        // directly auditable against the reference implementation. The loader
-        // guarantees max_snr > min_snr (both finite), so the divide is safe.
-        std::vector<float> feat((size_t) (n_freq * n_draft));
-        for (int64_t pos = 0; pos < n_draft; ++pos) {
+        // host-side: exact port of LogSnrEmbed.forward's featurization fused
+        // with the anchor/mask pattern above. Both are pure functions of
+        // n_draft/block_size/min_log_snr/max_log_snr -- all known here, no
+        // runtime/ubatch data involved -- so precomputing on the host (rather
+        // than chaining ggml_arange/ggml_sin/ggml_cos in-graph) keeps this
+        // directly auditable line-for-line against the python reference.
+        std::vector<float> feat((size_t) (n_freq * snr_rows));
+        for (int64_t pos = 0; pos < snr_rows; ++pos) {
             const float log_snr = (pos % bsz == 0) ? max_snr : min_snr;
             const float t       = (log_snr - min_snr) / (max_snr - min_snr) * 1000.0f;
             for (int64_t i = 0; i < half; ++i) {
-                const float freq  = expf(-logf(10000.0f) * (float) i / (float) half);
-                const float angle = t * freq;
+                const float freq                         = expf(-logf(10000.0f) * (float) i / (float) half);
+                const float angle                        = t * freq;
                 feat[(size_t) (pos * n_freq + i)]        = sinf(angle);
                 feat[(size_t) (pos * n_freq + half + i)] = cosf(angle);
             }
         }
 
-        auto logsnr_input = std::make_unique<llm_graph_input_dspark_logsnr>(std::move(feat));
-        logsnr_input->feat = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_freq, n_draft);
+        auto logsnr_input  = std::make_unique<llm_graph_input_dspark_logsnr>(std::move(feat));
+        logsnr_input->feat = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_freq, snr_rows);
         ggml_set_input(logsnr_input->feat);
         ggml_set_name(logsnr_input->feat, "dspark_log_snr_feat");
         ggml_tensor * snr_feat = logsnr_input->feat;
         res->add_input(std::move(logsnr_input));
 
         ggml_tensor * snr_hidden = build_lora_mm(model.dspark_log_snr_fc1_w, snr_feat);
-        snr_hidden = ggml_add(ctx0, snr_hidden, model.dspark_log_snr_fc1_b);
-        snr_hidden = ggml_silu(ctx0, snr_hidden);
+        snr_hidden               = ggml_add(ctx0, snr_hidden, model.dspark_log_snr_fc1_b);
+        snr_hidden               = ggml_silu(ctx0, snr_hidden);
         cb(snr_hidden, "dspark_log_snr_fc1", -1);
 
         ggml_tensor * snr_embed = build_lora_mm(model.dspark_log_snr_fc2_w, snr_hidden);
-        snr_embed = ggml_add(ctx0, snr_embed, model.dspark_log_snr_fc2_b);
+        snr_embed               = ggml_add(ctx0, snr_embed, model.dspark_log_snr_fc2_b);
         cb(snr_embed, "dspark_log_snr_fc2", -1);
+
+        if (compact_snr) {
+            auto * high  = ggml_view_2d(ctx0, snr_embed, n_embd, 1, snr_embed->nb[1], 0);
+            auto * low   = ggml_view_2d(ctx0, snr_embed, n_embd, 1, snr_embed->nb[1], snr_embed->nb[1]);
+            auto * masks = ggml_repeat_4d(ctx0, low, n_embd, n_draft - 1, 1, 1);
+            snr_embed    = ggml_concat(ctx0, high, masks, 1);
+            cb(snr_embed, "dspark_log_snr_expanded", -1);
+        }
 
         inpL = ggml_add(ctx0, inpL, snr_embed);
         cb(inpL, "dspark_draft_embd_snr", -1);
     }
 
-    ggml_tensor * inp_pos = build_inp_pos();
-    auto * inp_attn = build_attn_inp_kv();
+    if (model.dspark_mode_embedding) {
+        inpL = ggml_add(ctx0, inpL, model.dspark_mode_embedding);
+        cb(inpL, "dspark_draft_embd_mode", -1);
+    }
+
+    ggml_tensor * inp_pos  = build_inp_pos();
+    auto *        inp_attn = build_attn_inp_kv();
 
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
 
     ggml_tensor * cur;
 
     for (int il = 0; il < n_layer; ++il) {
-        ggml_tensor * inpSA = inpL; // [n_embd, n_draft]
+        ggml_tensor * inpSA = inpL;  // [n_embd, n_draft]
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
@@ -321,7 +351,7 @@ llama_model_dspark::graph::graph(const llama_model & model, const llm_graph_para
         ggml_tensor * attn_in = target_ctx ? ggml_concat(ctx0, target_ctx, cur, 1) : cur;
         cb(attn_in, "dspark_attn_in", il);
 
-        auto qkv = build_qkv(model.layers[il], attn_in, n_embd_head, n_head, n_head_kv, il);
+        auto          qkv  = build_qkv(model.layers[il], attn_in, n_embd_head, n_head, n_head_kv, il);
         ggml_tensor * Qcur = qkv.q;
         ggml_tensor * Kcur = qkv.k;
         ggml_tensor * Vcur = qkv.v;
@@ -331,14 +361,10 @@ llama_model_dspark::graph::graph(const llama_model & model, const llm_graph_para
         Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
         cb(Kcur, "Kcur_normed", il);
 
-        Qcur = ggml_rope_ext(
-                ctx0, Qcur, inp_pos, nullptr,
-                n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                ext_factor, attn_factor, beta_fast, beta_slow);
-        Kcur = ggml_rope_ext(
-                ctx0, Kcur, inp_pos, nullptr,
-                n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                ext_factor, attn_factor, beta_fast, beta_slow);
+        Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                             ext_factor, attn_factor, beta_fast, beta_slow);
+        Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                             ext_factor, attn_factor, beta_fast, beta_slow);
 
         cb(Qcur, "Qcur", il);
         cb(Kcur, "Kcur", il);
@@ -351,9 +377,8 @@ llama_model_dspark::graph::graph(const llama_model & model, const llm_graph_para
         // mask built here is fully open (no hybrid causal/bidirectional
         // complexity -- same masking style as build_attn_inp_no_cache() with
         // causal_attn=false, just backed by a real growing cache instead).
-        cur = build_attn(inp_attn,
-                model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        cur = build_attn(inp_attn, model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s, Qcur, Kcur, Vcur,
+                         nullptr, nullptr, nullptr, kq_scale, il);
         cb(cur, "dspark_attn_out_full", il);
 
         // discard the leading n_ctx_rows columns: those are attention output
@@ -375,12 +400,9 @@ llama_model_dspark::graph::graph(const llama_model & model, const llm_graph_para
         cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        cur = build_ffn(cur,
-                model.layers[il].ffn_up,   nullptr, model.layers[il].ffn_up_s,
-                model.layers[il].ffn_gate, nullptr, model.layers[il].ffn_gate_s,
-                model.layers[il].ffn_down, nullptr, model.layers[il].ffn_down_s,
-                nullptr,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cur = build_ffn(cur, model.layers[il].ffn_up, nullptr, model.layers[il].ffn_up_s, model.layers[il].ffn_gate,
+                        nullptr, model.layers[il].ffn_gate_s, model.layers[il].ffn_down, nullptr,
+                        model.layers[il].ffn_down_s, nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);
@@ -392,15 +414,158 @@ llama_model_dspark::graph::graph(const llama_model & model, const llm_graph_para
     }
 
     cur = inpL;
-    cb(cur, "h_pre_norm", -1);
+    cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // base trunk logits (pre markov-bias -- see file header comment).
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    if (hparams.dspark_hidden_correction) {
+        ggml_tensor *              trunk           = cur;
+        ggml_tensor *              chain           = nullptr;
+        ggml_tensor *              previous        = nullptr;
+        ggml_tensor *              markov_block    = nullptr;
+        ggml_tensor *              mask_markov     = nullptr;
+        const char *               assembly_env    = std::getenv("LLAMA_DSPARK_BALANCED_OUTPUT");
+        const bool                 balanced_output = assembly_env && std::strcmp(assembly_env, "1") == 0;
+        std::vector<ggml_tensor *> output_rows;
+        const char *               top_k_env = std::getenv("DSPARK_HEAD_TOP_K");
+        char *                     top_k_end = nullptr;
+        const int64_t              top_k     = top_k_env ? std::strtol(top_k_env, &top_k_end, 10) : 0;
+        if ((top_k_env && (top_k_end == top_k_env || *top_k_end != '\0')) || top_k < 0 || top_k > model.output->ne[1]) {
+            throw std::runtime_error("DSPARK_HEAD_TOP_K is outside the vocabulary");
+        }
+        if (top_k > 0 && model.hdmd.rot.count(model.output)) {
+            throw std::runtime_error("DSpark restricted head does not support folded output weights");
+        }
+        if (top_k > 0 && (model.output_s || (loras && !loras->empty()))) {
+            throw std::runtime_error("DSpark candidate heads do not support output scales or LoRA adapters");
+        }
+        if (top_k > 0) {
+            auto ids     = ggml_view_1d(ctx0, res->t_inp_tokens, n_draft, n_ctx_rows * sizeof(int32_t));
+            auto latent  = ggml_get_rows(ctx0, model.dspark_markov_head_a, ids);
+            markov_block = build_lora_mm(model.dspark_markov_head_b, latent);
+            cb(markov_block, "dspark_markov_block", -1);
+        }
+        ggml_tensor * base_block      = nullptr;
+        ggml_tensor * candidate_block = nullptr;
+        if (top_k > 0) {
+            base_block      = build_lora_mm(model.output, trunk, model.output_s);
+            candidate_block = ggml_top_k(ctx0, ggml_add(ctx0, base_block, markov_block), top_k);
+            cb(candidate_block, "dspark_candidates", -1);
+        }
+        int64_t n_correct = n_draft;
+        if (const char * value = std::getenv("LLAMA_DSPARK_CORRECTION_PREFIX")) {
+            char *     end  = nullptr;
+            const long keep = std::strtol(value, &end, 10);
+            if (end == value || *end || keep < 1 || keep > hparams.dspark_block_size) {
+                throw std::runtime_error("Invalid DSpark correction prefix");
+            }
+            // Keep the full trunk and batched projections; later correction slots cannot affect this prefix.
+            n_correct = std::min<int64_t>(n_draft, keep);
+            if (staged_input) {
+                staged_input->correction_prefix_rows = n_correct;
+            }
+        }
+        for (int64_t slot = 0; slot < n_correct; ++slot) {
+            auto ids = ggml_view_1d(ctx0, res->t_inp_tokens, 1, (n_ctx_rows + slot) * sizeof(int32_t));
+            if (slot % hparams.dspark_block_size == 0) {
+                previous = ids;
+            }
+            auto hidden    = ggml_view_2d(ctx0, trunk, n_embd, 1, trunk->nb[1], slot * trunk->nb[1]);
+            auto embedding = ggml_get_rows(ctx0, model.tok_embd, previous);
+            auto hn        = build_norm(hidden, model.dspark_corr_hnorm, nullptr, LLM_NORM_RMS, -1);
+            auto en        = build_norm(embedding, model.dspark_corr_enorm, nullptr, LLM_NORM_RMS, -1);
+            auto input     = ggml_concat(ctx0, hn, en, 0);
+            cb(input, "dspark_corr_input", slot);
+            auto gate  = ggml_silu(ctx0, build_lora_mm(model.dspark_corr_gate, input));
+            auto up    = build_lora_mm(model.dspark_corr_up, input);
+            auto delta = build_lora_mm(model.dspark_corr_down, ggml_mul(ctx0, gate, up));
+            cb(delta, "dspark_corr_delta", slot);
+            auto          corrected  = ggml_add(ctx0, hidden, delta);
+            ggml_tensor * candidates = nullptr;
+            ggml_tensor * head       = model.output;
+            if (candidate_block) {
+                const char * fuse_gather = std::getenv("GGML_METAL_FUSE_GATHER_MV");
+                if (fuse_gather && std::strcmp(fuse_gather, "1") == 0) {
+                    ggml_build_forward_expand(gf, corrected);
+                }
+                candidates = ggml_view_1d(ctx0, candidate_block, top_k, slot * candidate_block->nb[1]);
+                head       = ggml_get_rows(ctx0, model.output, candidates);
+            }
+            auto logits = candidate_block ? ggml_mul_mat(ctx0, head, corrected) :
+                                            build_lora_mm(model.output, corrected, model.output_s);
+            cb(logits, "dspark_corr_head", slot);
+            ggml_tensor * markov;
+            if (markov_block) {
+                markov = ggml_view_2d(ctx0, markov_block, markov_block->ne[0], 1, markov_block->nb[1],
+                                      slot * markov_block->nb[1]);
+            } else if (reuse_mask && slot > 1) {
+                markov = mask_markov;
+            } else {
+                auto latent = ggml_get_rows(ctx0, model.dspark_markov_head_a, ids);
+                cb(latent, "dspark_corr_markov", slot);
+                markov = build_lora_mm(model.dspark_markov_head_b, latent);
+                if (reuse_mask && slot == 1) {
+                    mask_markov = markov;
+                }
+            }
+            if (candidates) {
+                auto selected_markov = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, markov, 1, markov->ne[0]), candidates);
+                logits               = ggml_add(ctx0, logits, ggml_reshape_2d(ctx0, selected_markov, top_k, 1));
+                auto base =
+                    ggml_view_2d(ctx0, base_block, base_block->ne[0], 1, base_block->nb[1], slot * base_block->nb[1]);
+                auto dense = ggml_reshape_2d(ctx0, ggml_scale_bias(ctx0, base, 0.0f, -1e6f), 1, base->ne[0]);
+                logits     = ggml_reshape_2d(
+                    ctx0, ggml_set_rows(ctx0, dense, ggml_reshape_2d(ctx0, logits, 1, top_k), candidates), base->ne[0],
+                    1);
+            } else {
+                logits = ggml_add(ctx0, logits, markov);
+            }
+            cb(logits, "dspark_corr_unmasked", slot);
+            const size_t  mask_offset = hparams.dspark_mask_token_id * logits->nb[0];
+            auto          mask        = ggml_clamp(ctx0, ggml_view_1d(ctx0, logits, 1, mask_offset), -1e6f, -1e6f);
+            // Keep mask suppression out-of-place. SET with a source view of its
+            // destination can corrupt the other logits on the Metal backend.
+            const int64_t mask_id     = hparams.dspark_mask_token_id;
+            ggml_tensor * masked      = mask;
+            if (mask_id > 0) {
+                masked = ggml_concat(ctx0, ggml_view_1d(ctx0, logits, mask_id, 0), masked, 0);
+            }
+            if (mask_id + 1 < logits->ne[0]) {
+                masked = ggml_concat(
+                    ctx0, masked,
+                    ggml_view_1d(ctx0, logits, logits->ne[0] - mask_id - 1, (mask_id + 1) * logits->nb[0]), 0);
+            }
+            logits = masked;
+            cb(logits, "dspark_corr_masked", slot);
+            previous = ggml_argmax(ctx0, logits);
+            res->t_dspark_greedy.push_back(previous);
+            if (balanced_output) {
+                output_rows.push_back(logits);
+            } else {
+                chain = chain ? ggml_concat(ctx0, chain, logits, 1) : logits;
+            }
+        }
+        // Preserve row order without copying the growing prefix at every slot.
+        while (output_rows.size() > 1) {
+            std::vector<ggml_tensor *> next;
+            for (size_t i = 0; i < output_rows.size(); i += 2) {
+                next.push_back(i + 1 < output_rows.size() ? ggml_concat(ctx0, output_rows[i], output_rows[i + 1], 1) :
+                                                            output_rows[i]);
+            }
+            output_rows = std::move(next);
+        }
+        if (balanced_output) {
+            chain = output_rows.at(0);
+            cb(chain, "dspark_balanced_output", -1);
+            chain = ggml_view_2d(ctx0, chain, chain->ne[0], chain->ne[1], chain->nb[1], 0);
+        }
+        cur = chain;
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

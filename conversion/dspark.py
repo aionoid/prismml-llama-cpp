@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Iterable, TYPE_CHECKING
+from typing import Iterable, TYPE_CHECKING
 
 from .base import ModelBase, TextModel, gguf, logger
 
@@ -8,31 +8,9 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 
-@ModelBase.register("Qwen3DSparkModel", "DSparkForCausalLM", "DsparkSpeculator")
+@ModelBase.register("Qwen3DSparkModel", "DSparkForCausalLM", "DsparkSpeculator", "DSparkModel")
 class DSparkModel(TextModel):
-    """Converter for the dspark speculative-decoding drafter.
-
-    dspark is an EAGLE-style block-diffusion drafter. This converter maps an
-    EasyDeL dspark export onto the dspark GGUF tensor names. The drafter forward
-    graph and block-diffusion draft loop are implemented (src/models/dspark.cpp,
-    common/speculative.cpp), so the produced GGUF loads and runs as a draft-dspark
-    speculator. See docs/dspark-scope.md for the drafter shape and the capture API.
-
-    Tensor name mapping (HF Qwen3DSparkModel export -> gguf):
-        fc                          -> dspark.fc
-        hidden_norm                 -> dspark.hidden_norm
-        norm                        -> output_norm
-        lm_head                     -> output
-        embed_tokens                -> token_embd
-        markov_head.markov_w1       -> dspark.markov_head_a   (prev-token Embed [vocab, rank])
-        markov_head.markov_w2       -> dspark.markov_head_b   (Linear [vocab, rank])
-        confidence_head.proj.weight -> dspark.confidence_head.weight
-        confidence_head.proj.bias   -> dspark.confidence_head.bias
-        layers.{i}.<attn/ffn/...>   -> blk.{i}.<standard names via tensor_map>
-
-    Older EasyDeL exports used markov_head.{down,up} and a bare confidence_head;
-    those aliases are kept below so both layouts convert.
-    """
+    """Convert a DSpark checkpoint with its target vocabulary and correction weights."""
 
     model_arch = gguf.MODEL_ARCH.DSPARK
 
@@ -60,26 +38,47 @@ class DSparkModel(TextModel):
     _name_map = {
         "fc":                    gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_FC],
         "hidden_norm":           gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_HIDDEN_NORM],
+        "log_snr_embed.fc1": "dspark.log_snr_fc1",
+        "log_snr_embed.fc2": "dspark.log_snr_fc2",
+        "hidden_correction.hidden_norm": "dspark.correction_hidden_norm",
+        "hidden_correction.embed_norm": "dspark.correction_embed_norm",
+        "hidden_correction.gate_proj": "dspark.correction_gate",
+        "hidden_correction.up_proj": "dspark.correction_up",
+        "hidden_correction.down_proj": "dspark.correction_down",
         # HF Qwen3DSparkModel names: markov_w1 = prev-token Embed [vocab, rank],
         # markov_w2 = Linear [vocab, rank]; confidence_head is a proj with a bias.
         "markov_head.markov_w1": gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_MARKOV_HEAD_A],
+        "markov_head.prev_embed": gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_MARKOV_HEAD_A],
         "markov_head.markov_w2": gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_MARKOV_HEAD_B],
         "confidence_head.proj":  gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_CONFIDENCE_HEAD],
-        # legacy EasyDeL aliases (kept so older exports still convert):
+        # legacy aliases (kept so older exports still convert):
         "markov_head.down":      gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_MARKOV_HEAD_A],
         "markov_head.up":        gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_MARKOV_HEAD_B],
         "confidence_head":       gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_CONFIDENCE_HEAD],
-        "log_snr_embed.fc1":     gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_LOG_SNR_FC1],
-        "log_snr_embed.fc2":     gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_LOG_SNR_FC2],
     }
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 
         hp = self.hparams
+        correction = bool(hp.get("enable_hidden_correction", False))
+        exposure = bool(hp.get("markov_deploy_exposure", False))
+        if correction and (not exposure or hp.get("markov_head_type", "vanilla") != "vanilla"):
+            raise ValueError("Production DSpark requires vanilla deploy-exposure Markov")
+        if exposure and not correction:
+            raise ValueError("Deploy exposure without hidden correction is unsupported")
+        self.gguf_writer.add_bool("dspark.dspark.hidden_correction", correction)
+        self.gguf_writer.add_bool("dspark.dspark.markov_deploy_exposure", exposure)
+        if correction:
+            self.gguf_writer.add_uint32("dspark.dspark.correction_size", int(hp.get("hidden_correction_intermediate_size") or hp["hidden_size"]))
+        snr = bool(hp.get("log_snr_conditioning", False))
+        self.gguf_writer.add_bool("dspark.dspark.log_snr_conditioning", snr)
+        if snr:
+            self.gguf_writer.add_float32("dspark.dspark.min_log_snr", float(hp["min_log_snr"]))
+            self.gguf_writer.add_float32("dspark.dspark.max_log_snr", float(hp["max_log_snr"]))
 
         # dspark drafter trunk is a small transformer; block_count is its depth.
-        # (EasyDeL exports this under "num_hidden_layers"; TextModel already wired
+        # (exports carry this as "num_hidden_layers"; TextModel already wired
         # block_count from that, so nothing extra needed here.)
 
         block_size = int(hp.get("block_size", 7))
@@ -105,23 +104,7 @@ class DSparkModel(TextModel):
         if conf_with_markov is not None:
             self.gguf_writer.add_dspark_confidence_head_with_markov(bool(conf_with_markov))
 
-        log_snr_cond = hp.get("log_snr_conditioning")
-        if log_snr_cond is not None:
-            self.gguf_writer.add_dspark_log_snr_conditioning(bool(log_snr_cond))
-
-        min_log_snr = hp.get("min_log_snr")
-        if min_log_snr is not None:
-            self.gguf_writer.add_dspark_min_log_snr(float(min_log_snr))
-
-        max_log_snr = hp.get("max_log_snr")
-        if max_log_snr is not None:
-            self.gguf_writer.add_dspark_max_log_snr(float(max_log_snr))
-
-        logger.info(
-            "dspark: exported drafter (block_size=%d, target_layers=%s); "
-            "see docs/dspark-scope.md",
-            block_size, target_layers,
-        )
+        logger.info("dspark: block_size=%d target_layers=%s hidden_correction=%s", block_size, target_layers, correction)
 
     def modify_tensors(self, data_torch: "Tensor", name: str, bid: int | None) -> Iterable[tuple[str, "Tensor"]]:
         n = name
@@ -133,6 +116,14 @@ class DSparkModel(TextModel):
                 break
 
         # structural / head tensors with a direct mapping
+        if n == "hidden_correction.gate_up_proj.weight":
+            width = int(self.hparams.get("hidden_correction_intermediate_size") or self.hparams["hidden_size"])
+            if tuple(data_torch.shape) != (2 * width, 2 * int(self.hparams["hidden_size"])):
+                raise ValueError("Unexpected fused hidden-correction projection shape")
+            if int(self.hparams.get("fused_param_tp", 1)) != 1:
+                raise ValueError("Unfuse TP-interleaved correction weights before GGUF conversion")
+            return [("dspark.correction_gate.weight", data_torch[:width]),
+                    ("dspark.correction_up.weight", data_torch[width:])]
         for src, dst in self._name_map.items():
             if n == f"{src}.weight":
                 return [(dst + ".weight", data_torch)]
@@ -147,15 +138,5 @@ class DSparkModel(TextModel):
             return [(gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.TOKEN_EMBD] + ".weight", data_torch)]
 
         # per-layer decoder tensors fall through to the standard mapping. The base
-        # class resolves (model.)layers.{bid}.<attn/mlp...> to blk.{bid}.<gguf name>.
-        # Strip only the dspark-specific wrapper (drafter./dspark.) here -- the head
-        # loop above matched against the fully stripped `n`, but this fallthrough
-        # must not pass an unsupported drafter./dspark. prefix to map_tensor_name or
-        # the per-layer tensor fails to map. Keep any standard model. prefix, which
-        # map_tensor_name already understands.
-        fallthrough_name = name
-        for prefix in ("drafter.", "dspark."):
-            if fallthrough_name.startswith(prefix):
-                fallthrough_name = fallthrough_name[len(prefix):]
-                break
-        return [(self.map_tensor_name(fallthrough_name), data_torch)]
+        # class resolves layers.{bid}.<attn/mlp...> to blk.{bid}.<gguf name>.
+        return [(self.map_tensor_name(n), data_torch)]
